@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-cicd-nodeapp
+  namespace: ai-cicd
+  labels:
+    app: ai-cicd-nodeapp
+spec:
+  type: LoadBalancer
+  selector:
+    app: ai-cicd-nodeapp
+  ports:
+    - name: http
+      port: 80
+      targetPort: 3000
