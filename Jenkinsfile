@@ -1,7 +1,7 @@
 pipeline {
   agent {
     kubernetes {
-      yaml """
+yaml """
 apiVersion: v1
 kind: Pod
 metadata:
@@ -11,6 +11,16 @@ spec:
   serviceAccountName: jenkins
   restartPolicy: Never
   containers:
+    - name: jnlp
+      image: jenkins/inbound-agent:latest
+      resources:
+        requests:
+          cpu: "50m"
+          memory: "128Mi"
+        limits:
+          cpu: "300m"
+          memory: "512Mi"
+
     - name: node
       image: node:20-bookworm-slim
       command:
@@ -18,10 +28,10 @@ spec:
       tty: true
       resources:
         requests:
-          cpu: "300m"
-          memory: "512Mi"
+          cpu: "50m"
+          memory: "256Mi"
         limits:
-          cpu: "1"
+          cpu: "700m"
           memory: "1Gi"
 
     - name: kaniko
@@ -31,11 +41,11 @@ spec:
       tty: true
       resources:
         requests:
-          cpu: "500m"
-          memory: "1Gi"
+          cpu: "100m"
+          memory: "512Mi"
         limits:
-          cpu: "2"
-          memory: "3Gi"
+          cpu: "1"
+          memory: "2Gi"
 
     - name: trivy
       image: public.ecr.aws/aquasecurity/trivy:0.71.0
@@ -44,11 +54,11 @@ spec:
       tty: true
       resources:
         requests:
-          cpu: "300m"
-          memory: "512Mi"
+          cpu: "50m"
+          memory: "384Mi"
         limits:
-          cpu: "1"
-          memory: "2Gi"
+          cpu: "800m"
+          memory: "1536Mi"
 
     - name: kubectl
       image: bitnami/kubectl:latest
@@ -57,10 +67,10 @@ spec:
       tty: true
       resources:
         requests:
-          cpu: "100m"
+          cpu: "25m"
           memory: "128Mi"
         limits:
-          cpu: "500m"
+          cpu: "300m"
           memory: "512Mi"
 
     - name: python
@@ -70,10 +80,10 @@ spec:
       tty: true
       resources:
         requests:
-          cpu: "100m"
+          cpu: "25m"
           memory: "128Mi"
         limits:
-          cpu: "500m"
+          cpu: "300m"
           memory: "512Mi"
 """
       defaultContainer 'node'
