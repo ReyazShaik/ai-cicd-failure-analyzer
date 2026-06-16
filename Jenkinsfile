@@ -119,20 +119,19 @@ spec:
 
         container('jnlp') {
           script {
-            def scmVars = checkout scm
-
-            if (scmVars.GIT_COMMIT) {
-              env.GIT_COMMIT_SHORT = scmVars.GIT_COMMIT.take(7)
-            } else {
-              env.GIT_COMMIT_SHORT = "unknown"
-            }
+            checkout scm
 
             sh '''
               mkdir -p logs
+              echo "Checkout" > logs/current-stage.txt
             '''
 
+            env.GIT_COMMIT_SHORT = sh(
+              script: 'git rev-parse --short HEAD',
+              returnStdout: true
+            ).trim()
+
             writeFile file: 'logs/git-commit.log', text: "${env.GIT_COMMIT_SHORT}\n"
-            writeFile file: 'logs/current-stage.txt', text: "Checkout\n"
 
             sh '''
               echo "Checked out commit:"
@@ -148,15 +147,25 @@ spec:
         script {
           env.CURRENT_STAGE = "Install Dependencies"
           env.FAILED_STAGE = "Install Dependencies"
-          writeFile file: 'logs/current-stage.txt', text: "Install Dependencies\n"
         }
+
+        sh '''
+          mkdir -p logs
+          echo "Install Dependencies" > logs/current-stage.txt
+        '''
 
         container('node') {
           sh '''
+            set +e
             cd app
+
             npm ci > ../logs/npm-install.log 2>&1
             status=$?
+
+            echo "========== npm install logs =========="
             cat ../logs/npm-install.log
+            echo "======================================"
+
             exit $status
           '''
         }
@@ -168,15 +177,25 @@ spec:
         script {
           env.CURRENT_STAGE = "Run Unit Tests"
           env.FAILED_STAGE = "Run Unit Tests"
-          writeFile file: 'logs/current-stage.txt', text: "Run Unit Tests\n"
         }
+
+        sh '''
+          mkdir -p logs
+          echo "Run Unit Tests" > logs/current-stage.txt
+        '''
 
         container('node') {
           sh '''
+            set +e
             cd app
+
             npm test > ../logs/unit-test.log 2>&1
             status=$?
+
+            echo "========== unit test logs =========="
             cat ../logs/unit-test.log
+            echo "===================================="
+
             exit $status
           '''
         }
@@ -188,8 +207,12 @@ spec:
         script {
           env.CURRENT_STAGE = "Build and Push Docker Image"
           env.FAILED_STAGE = "Build and Push Docker Image"
-          writeFile file: 'logs/current-stage.txt', text: "Build and Push Docker Image\n"
         }
+
+        sh '''
+          mkdir -p logs
+          echo "Build and Push Docker Image" > logs/current-stage.txt
+        '''
 
         container('kaniko') {
           withCredentials([
@@ -200,6 +223,7 @@ spec:
             )
           ]) {
             sh '''
+              set +e
               mkdir -p logs
               mkdir -p /kaniko/.docker
 
@@ -228,7 +252,11 @@ CONFIG
                 > logs/docker-build.log 2>&1
 
               status=$?
+
+              echo "========== Docker build logs =========="
               cat logs/docker-build.log
+              echo "======================================="
+
               exit $status
             '''
           }
@@ -246,8 +274,12 @@ CONFIG
         script {
           env.CURRENT_STAGE = "Trivy Security Scan"
           env.FAILED_STAGE = "Trivy Security Scan"
-          writeFile file: 'logs/current-stage.txt', text: "Trivy Security Scan\n"
         }
+
+        sh '''
+          mkdir -p logs
+          echo "Trivy Security Scan" > logs/current-stage.txt
+        '''
 
         container('trivy') {
           withCredentials([
@@ -258,6 +290,7 @@ CONFIG
             )
           ]) {
             sh '''
+              set +e
               mkdir -p logs .trivycache
 
               echo "Scanning image: ${IMAGE_FULL_NAME}"
@@ -272,7 +305,11 @@ CONFIG
                 "${IMAGE_FULL_NAME}"
 
               status=$?
+
+              echo "========== Trivy scan logs =========="
               cat logs/trivy-report.txt
+              echo "====================================="
+
               exit $status
             '''
           }
@@ -285,11 +322,16 @@ CONFIG
         script {
           env.CURRENT_STAGE = "Deploy to Kubernetes"
           env.FAILED_STAGE = "Deploy to Kubernetes"
-          writeFile file: 'logs/current-stage.txt', text: "Deploy to Kubernetes\n"
         }
+
+        sh '''
+          mkdir -p logs
+          echo "Deploy to Kubernetes" > logs/current-stage.txt
+        '''
 
         container('kubectl') {
           sh '''
+            set +e
             mkdir -p logs
 
             echo "Deploying image: ${IMAGE_FULL_NAME}"
@@ -308,7 +350,11 @@ CONFIG
             kubectl get pods,svc,hpa -n "${K8S_NAMESPACE}" >> logs/k8s-deploy.log 2>&1
 
             status=$?
+
+            echo "========== Kubernetes deploy logs =========="
             cat logs/k8s-deploy.log
+            echo "============================================"
+
             exit $status
           '''
         }
