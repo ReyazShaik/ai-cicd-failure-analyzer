@@ -13,6 +13,7 @@ spec:
   restartPolicy: Never
   nodeSelector:
     kubernetes.io/os: linux
+
   containers:
     - name: jnlp
       image: jenkins/inbound-agent:latest
@@ -103,10 +104,12 @@ spec:
     K8S_NAMESPACE = "ai-cicd"
     OLLAMA_URL = "http://ollama.ai-cicd.svc.cluster.local:11434"
     OLLAMA_MODEL = "tinyllama"
+
     CURRENT_STAGE = "STARTED"
     FAILED_STAGE = "STARTED"
-    IMAGE_FULL_NAME = ""
+
     GIT_COMMIT_SHORT = "unknown"
+    IMAGE_FULL_NAME = ""
   }
 
   stages {
@@ -123,13 +126,19 @@ spec:
 
             sh '''
               mkdir -p logs
-              echo "Checkout" > logs/current-stage.txt
+              printf "Checkout\\n" > logs/current-stage.txt
             '''
 
             env.GIT_COMMIT_SHORT = sh(
-              script: 'git rev-parse --short HEAD',
+              script: '''
+                git rev-parse --short HEAD 2>/dev/null || echo unknown
+              ''',
               returnStdout: true
             ).trim()
+
+            if (!env.GIT_COMMIT_SHORT || env.GIT_COMMIT_SHORT == "unknown") {
+              env.GIT_COMMIT_SHORT = "${BUILD_NUMBER}"
+            }
 
             writeFile file: 'logs/git-commit.log', text: "${env.GIT_COMMIT_SHORT}\n"
 
@@ -149,15 +158,26 @@ spec:
           env.FAILED_STAGE = "Install Dependencies"
         }
 
-        sh '''
-          mkdir -p logs
-          echo "Install Dependencies" > logs/current-stage.txt
-        '''
+        container('jnlp') {
+          sh '''
+            mkdir -p logs
+            printf "Install Dependencies\\n" > logs/current-stage.txt
+          '''
+        }
 
         container('node') {
           sh '''
             set +e
+
             cd app
+
+            if [ ! -f package-lock.json ]; then
+              echo "ERROR: package-lock.json is missing." > ../logs/npm-install.log
+              echo "npm ci requires package-lock.json." >> ../logs/npm-install.log
+              echo "Fix: run npm install locally, commit app/package-lock.json, then rerun Jenkins." >> ../logs/npm-install.log
+              cat ../logs/npm-install.log
+              exit 1
+            fi
 
             npm ci > ../logs/npm-install.log 2>&1
             status=$?
@@ -179,14 +199,17 @@ spec:
           env.FAILED_STAGE = "Run Unit Tests"
         }
 
-        sh '''
-          mkdir -p logs
-          echo "Run Unit Tests" > logs/current-stage.txt
-        '''
+        container('jnlp') {
+          sh '''
+            mkdir -p logs
+            printf "Run Unit Tests\\n" > logs/current-stage.txt
+          '''
+        }
 
         container('node') {
           sh '''
             set +e
+
             cd app
 
             npm test > ../logs/unit-test.log 2>&1
@@ -209,10 +232,12 @@ spec:
           env.FAILED_STAGE = "Build and Push Docker Image"
         }
 
-        sh '''
-          mkdir -p logs
-          echo "Build and Push Docker Image" > logs/current-stage.txt
-        '''
+        container('jnlp') {
+          sh '''
+            mkdir -p logs
+            printf "Build and Push Docker Image\\n" > logs/current-stage.txt
+          '''
+        }
 
         container('kaniko') {
           withCredentials([
@@ -224,8 +249,24 @@ spec:
           ]) {
             sh '''
               set +e
+
               mkdir -p logs
               mkdir -p /kaniko/.docker
+
+              if [ -z "${DOCKER_USER}" ]; then
+                echo "ERROR: DOCKER_USER is empty. Check Jenkins credential ID: dockerhub-creds" | tee logs/docker-build.log
+                exit 1
+              fi
+
+              COMMIT_TAG="$(cat logs/git-commit.log 2>/dev/null | tr -d '\\r\\n ')"
+
+              if [ -z "${COMMIT_TAG}" ] || [ "${COMMIT_TAG}" = "unknown" ]; then
+                COMMIT_TAG="${BUILD_NUMBER}"
+              fi
+
+              IMAGE="${DOCKER_USER}/${IMAGE_NAME}:${COMMIT_TAG}"
+
+              echo "${IMAGE}" > logs/image-name.log
 
               cat > /kaniko/.docker/config.json <<CONFIG
 {
@@ -238,8 +279,8 @@ spec:
 }
 CONFIG
 
-              IMAGE="${DOCKER_USER}/${IMAGE_NAME}:${GIT_COMMIT_SHORT}"
-              echo "${IMAGE}" > logs/image-name.log
+              echo "Image name saved to logs/image-name.log:"
+              cat logs/image-name.log
 
               echo "Building and pushing image: ${IMAGE}"
 
@@ -256,6 +297,9 @@ CONFIG
               echo "========== Docker build logs =========="
               cat logs/docker-build.log
               echo "======================================="
+
+              echo "Final image name:"
+              cat logs/image-name.log
 
               exit $status
             '''
@@ -276,10 +320,12 @@ CONFIG
           env.FAILED_STAGE = "Trivy Security Scan"
         }
 
-        sh '''
-          mkdir -p logs
-          echo "Trivy Security Scan" > logs/current-stage.txt
-        '''
+        container('jnlp') {
+          sh '''
+            mkdir -p logs
+            printf "Trivy Security Scan\\n" > logs/current-stage.txt
+          '''
+        }
 
         container('trivy') {
           withCredentials([
@@ -291,18 +337,29 @@ CONFIG
           ]) {
             sh '''
               set +e
+
               mkdir -p logs .trivycache
 
-              echo "Scanning image: ${IMAGE_FULL_NAME}"
+              IMAGE_TO_SCAN="$(cat logs/image-name.log 2>/dev/null | tr -d '\\r\\n ')"
+
+              if [ -z "${IMAGE_TO_SCAN}" ]; then
+                echo "ERROR: IMAGE_TO_SCAN is empty." | tee logs/trivy-report.txt
+                echo "logs/image-name.log was not created or is empty." | tee -a logs/trivy-report.txt
+                echo "Check Build and Push Docker Image stage." | tee -a logs/trivy-report.txt
+                exit 1
+              fi
+
+              echo "Scanning image: ${IMAGE_TO_SCAN}"
 
               trivy image \
+                --skip-version-check \
                 --cache-dir .trivycache \
                 --severity HIGH,CRITICAL \
                 --ignore-unfixed \
                 --exit-code 1 \
                 --format table \
                 -o logs/trivy-report.txt \
-                "${IMAGE_FULL_NAME}"
+                "${IMAGE_TO_SCAN}"
 
               status=$?
 
@@ -324,20 +381,31 @@ CONFIG
           env.FAILED_STAGE = "Deploy to Kubernetes"
         }
 
-        sh '''
-          mkdir -p logs
-          echo "Deploy to Kubernetes" > logs/current-stage.txt
-        '''
+        container('jnlp') {
+          sh '''
+            mkdir -p logs
+            printf "Deploy to Kubernetes\\n" > logs/current-stage.txt
+          '''
+        }
 
         container('kubectl') {
           sh '''
             set +e
+
             mkdir -p logs
 
-            echo "Deploying image: ${IMAGE_FULL_NAME}"
+            IMAGE_TO_DEPLOY="$(cat logs/image-name.log 2>/dev/null | tr -d '\\r\\n ')"
+
+            if [ -z "${IMAGE_TO_DEPLOY}" ]; then
+              echo "ERROR: IMAGE_TO_DEPLOY is empty." | tee logs/k8s-deploy.log
+              echo "logs/image-name.log was not created or is empty." | tee -a logs/k8s-deploy.log
+              exit 1
+            fi
+
+            echo "Deploying image: ${IMAGE_TO_DEPLOY}"
 
             cp k8s/deployment.yaml /tmp/deployment.yaml
-            sed -i "s|REPLACE_IMAGE|${IMAGE_FULL_NAME}|g" /tmp/deployment.yaml
+            sed -i "s|REPLACE_IMAGE|${IMAGE_TO_DEPLOY}|g" /tmp/deployment.yaml
 
             kubectl apply -f /tmp/deployment.yaml > logs/k8s-deploy.log 2>&1
             kubectl apply -f k8s/service.yaml >> logs/k8s-deploy.log 2>&1
@@ -365,6 +433,15 @@ CONFIG
   post {
     success {
       archiveArtifacts artifacts: 'logs/**', fingerprint: true
+
+      script {
+        if (fileExists('logs/image-name.log')) {
+          env.IMAGE_FULL_NAME = readFile('logs/image-name.log').trim()
+        }
+        if (fileExists('logs/git-commit.log')) {
+          env.GIT_COMMIT_SHORT = readFile('logs/git-commit.log').trim()
+        }
+      }
 
       container('python') {
         withCredentials([
@@ -410,16 +487,36 @@ PY
 
       script {
         if (fileExists('logs/current-stage.txt')) {
-          env.FAILED_STAGE = readFile('logs/current-stage.txt').trim()
+          def stageFromFile = readFile('logs/current-stage.txt').trim()
+
+          if (stageFromFile && stageFromFile != "STARTED") {
+            env.FAILED_STAGE = stageFromFile
+          } else {
+            env.FAILED_STAGE = env.CURRENT_STAGE
+          }
         } else {
           env.FAILED_STAGE = env.CURRENT_STAGE
+        }
+
+        if (!env.FAILED_STAGE || env.FAILED_STAGE == "STARTED") {
+          env.FAILED_STAGE = "Unknown Failed Stage"
+        }
+
+        if (fileExists('logs/git-commit.log')) {
+          env.GIT_COMMIT_SHORT = readFile('logs/git-commit.log').trim()
         }
 
         if (!env.GIT_COMMIT_SHORT || env.GIT_COMMIT_SHORT == "") {
           env.GIT_COMMIT_SHORT = "unknown"
         }
 
+        if (fileExists('logs/image-name.log')) {
+          env.IMAGE_FULL_NAME = readFile('logs/image-name.log').trim()
+        }
+
         echo "Detected failed stage: ${env.FAILED_STAGE}"
+        echo "Detected commit: ${env.GIT_COMMIT_SHORT}"
+        echo "Detected image: ${env.IMAGE_FULL_NAME}"
       }
 
       container('python') {
@@ -451,6 +548,7 @@ msg = f"""
 *Build:* {os.environ.get('BUILD_NUMBER')}
 *Failed Stage:* {os.environ.get('FAILED_STAGE')}
 *Commit:* {os.environ.get('GIT_COMMIT_SHORT')}
+*Image:* {os.environ.get('IMAGE_FULL_NAME')}
 *Build URL:* {os.environ.get('BUILD_URL')}
 
 AI analyzer script was not found in the workspace. Check whether repository checkout completed successfully.
