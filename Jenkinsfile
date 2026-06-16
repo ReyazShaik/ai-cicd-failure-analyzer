@@ -1,7 +1,8 @@
 pipeline {
   agent {
     kubernetes {
-yaml """
+      defaultContainer 'node'
+      yaml """
 apiVersion: v1
 kind: Pod
 metadata:
@@ -10,6 +11,8 @@ metadata:
 spec:
   serviceAccountName: jenkins
   restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/os: linux
   containers:
     - name: jnlp
       image: jenkins/inbound-agent:latest
@@ -86,11 +89,11 @@ spec:
           cpu: "300m"
           memory: "512Mi"
 """
-      defaultContainer 'node'
     }
   }
 
   options {
+    skipDefaultCheckout(true)
     buildDiscarder(logRotator(numToKeepStr: '20'))
     timeout(time: 30, unit: 'MINUTES')
   }
@@ -99,10 +102,11 @@ spec:
     IMAGE_NAME = "ai-cicd-nodeapp"
     K8S_NAMESPACE = "ai-cicd"
     OLLAMA_URL = "http://ollama.ai-cicd.svc.cluster.local:11434"
-    OLLAMA_MODEL = "llama3.2:1b"
+    OLLAMA_MODEL = "tinyllama"
     CURRENT_STAGE = "STARTED"
+    FAILED_STAGE = "STARTED"
     IMAGE_FULL_NAME = ""
-    GIT_COMMIT_SHORT = ""
+    GIT_COMMIT_SHORT = "unknown"
   }
 
   stages {
@@ -110,15 +114,31 @@ spec:
       steps {
         script {
           env.CURRENT_STAGE = "Checkout"
+          env.FAILED_STAGE = "Checkout"
         }
-        checkout scm
-        sh '''
-          mkdir -p logs
-          git rev-parse --short HEAD > logs/git-commit.log
-          cat logs/git-commit.log
-        '''
-        script {
-          env.GIT_COMMIT_SHORT = sh(script: "cat logs/git-commit.log", returnStdout: true).trim()
+
+        container('jnlp') {
+          script {
+            def scmVars = checkout scm
+
+            if (scmVars.GIT_COMMIT) {
+              env.GIT_COMMIT_SHORT = scmVars.GIT_COMMIT.take(7)
+            } else {
+              env.GIT_COMMIT_SHORT = "unknown"
+            }
+
+            sh '''
+              mkdir -p logs
+            '''
+
+            writeFile file: 'logs/git-commit.log', text: "${env.GIT_COMMIT_SHORT}\n"
+            writeFile file: 'logs/current-stage.txt', text: "Checkout\n"
+
+            sh '''
+              echo "Checked out commit:"
+              cat logs/git-commit.log
+            '''
+          }
         }
       }
     }
@@ -127,10 +147,12 @@ spec:
       steps {
         script {
           env.CURRENT_STAGE = "Install Dependencies"
+          env.FAILED_STAGE = "Install Dependencies"
+          writeFile file: 'logs/current-stage.txt', text: "Install Dependencies\n"
         }
+
         container('node') {
           sh '''
-            mkdir -p logs
             cd app
             npm ci > ../logs/npm-install.log 2>&1
             status=$?
@@ -145,7 +167,10 @@ spec:
       steps {
         script {
           env.CURRENT_STAGE = "Run Unit Tests"
+          env.FAILED_STAGE = "Run Unit Tests"
+          writeFile file: 'logs/current-stage.txt', text: "Run Unit Tests\n"
         }
+
         container('node') {
           sh '''
             cd app
@@ -162,7 +187,10 @@ spec:
       steps {
         script {
           env.CURRENT_STAGE = "Build and Push Docker Image"
+          env.FAILED_STAGE = "Build and Push Docker Image"
+          writeFile file: 'logs/current-stage.txt', text: "Build and Push Docker Image\n"
         }
+
         container('kaniko') {
           withCredentials([
             usernamePassword(
@@ -187,7 +215,9 @@ spec:
 CONFIG
 
               IMAGE="${DOCKER_USER}/${IMAGE_NAME}:${GIT_COMMIT_SHORT}"
-              echo "$IMAGE" > logs/image-name.log
+              echo "${IMAGE}" > logs/image-name.log
+
+              echo "Building and pushing image: ${IMAGE}"
 
               /kaniko/executor \
                 --context "${WORKSPACE}" \
@@ -203,8 +233,10 @@ CONFIG
             '''
           }
         }
+
         script {
-          env.IMAGE_FULL_NAME = sh(script: "cat logs/image-name.log", returnStdout: true).trim()
+          env.IMAGE_FULL_NAME = readFile('logs/image-name.log').trim()
+          echo "Image created: ${env.IMAGE_FULL_NAME}"
         }
       }
     }
@@ -213,24 +245,37 @@ CONFIG
       steps {
         script {
           env.CURRENT_STAGE = "Trivy Security Scan"
+          env.FAILED_STAGE = "Trivy Security Scan"
+          writeFile file: 'logs/current-stage.txt', text: "Trivy Security Scan\n"
         }
+
         container('trivy') {
-          sh '''
-            mkdir -p logs .trivycache
+          withCredentials([
+            usernamePassword(
+              credentialsId: 'dockerhub-creds',
+              usernameVariable: 'TRIVY_USERNAME',
+              passwordVariable: 'TRIVY_PASSWORD'
+            )
+          ]) {
+            sh '''
+              mkdir -p logs .trivycache
 
-            trivy image \
-              --cache-dir .trivycache \
-              --severity HIGH,CRITICAL \
-              --ignore-unfixed \
-              --exit-code 1 \
-              --format table \
-              -o logs/trivy-report.txt \
-              "${IMAGE_FULL_NAME}"
+              echo "Scanning image: ${IMAGE_FULL_NAME}"
 
-            status=$?
-            cat logs/trivy-report.txt
-            exit $status
-          '''
+              trivy image \
+                --cache-dir .trivycache \
+                --severity HIGH,CRITICAL \
+                --ignore-unfixed \
+                --exit-code 1 \
+                --format table \
+                -o logs/trivy-report.txt \
+                "${IMAGE_FULL_NAME}"
+
+              status=$?
+              cat logs/trivy-report.txt
+              exit $status
+            '''
+          }
         }
       }
     }
@@ -239,10 +284,15 @@ CONFIG
       steps {
         script {
           env.CURRENT_STAGE = "Deploy to Kubernetes"
+          env.FAILED_STAGE = "Deploy to Kubernetes"
+          writeFile file: 'logs/current-stage.txt', text: "Deploy to Kubernetes\n"
         }
+
         container('kubectl') {
           sh '''
             mkdir -p logs
+
+            echo "Deploying image: ${IMAGE_FULL_NAME}"
 
             cp k8s/deployment.yaml /tmp/deployment.yaml
             sed -i "s|REPLACE_IMAGE|${IMAGE_FULL_NAME}|g" /tmp/deployment.yaml
@@ -293,13 +343,16 @@ Deployment completed successfully.
 """
 
 webhook = os.environ.get("SLACK_WEBHOOK_URL")
+
 req = urllib.request.Request(
     webhook,
     data=json.dumps({"text": msg}).encode("utf-8"),
     headers={"Content-Type": "application/json"},
     method="POST"
 )
+
 urllib.request.urlopen(req, timeout=30)
+print("Slack success notification sent.")
 PY
           '''
         }
@@ -309,26 +362,76 @@ PY
     failure {
       archiveArtifacts artifacts: 'logs/**', allowEmptyArchive: true, fingerprint: true
 
+      script {
+        if (fileExists('logs/current-stage.txt')) {
+          env.FAILED_STAGE = readFile('logs/current-stage.txt').trim()
+        } else {
+          env.FAILED_STAGE = env.CURRENT_STAGE
+        }
+
+        if (!env.GIT_COMMIT_SHORT || env.GIT_COMMIT_SHORT == "") {
+          env.GIT_COMMIT_SHORT = "unknown"
+        }
+
+        echo "Detected failed stage: ${env.FAILED_STAGE}"
+      }
+
       container('python') {
         withCredentials([
           string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK_URL')
         ]) {
           sh '''
-            python3 ai-analyzer/analyze_failure.py \
-              --job "${JOB_NAME}" \
-              --build "${BUILD_NUMBER}" \
-              --stage "${CURRENT_STAGE}" \
-              --build-url "${BUILD_URL}" \
-              --commit "${GIT_COMMIT_SHORT}" \
-              --logs-dir logs \
-              --ollama-url "${OLLAMA_URL}" \
-              --model "${OLLAMA_MODEL}" \
-              --slack-webhook "${SLACK_WEBHOOK_URL}"
+            if [ -f ai-analyzer/analyze_failure.py ]; then
+              python3 ai-analyzer/analyze_failure.py \
+                --job "${JOB_NAME}" \
+                --build "${BUILD_NUMBER}" \
+                --stage "${FAILED_STAGE}" \
+                --build-url "${BUILD_URL}" \
+                --commit "${GIT_COMMIT_SHORT}" \
+                --logs-dir logs \
+                --ollama-url "${OLLAMA_URL}" \
+                --model "${OLLAMA_MODEL}" \
+                --slack-webhook "${SLACK_WEBHOOK_URL}"
+            else
+              python3 - <<PY
+import json
+import os
+import urllib.request
+
+msg = f"""
+🚨 *CI/CD Pipeline Failed*
+
+*Job:* {os.environ.get('JOB_NAME')}
+*Build:* {os.environ.get('BUILD_NUMBER')}
+*Failed Stage:* {os.environ.get('FAILED_STAGE')}
+*Commit:* {os.environ.get('GIT_COMMIT_SHORT')}
+*Build URL:* {os.environ.get('BUILD_URL')}
+
+AI analyzer script was not found in the workspace. Check whether repository checkout completed successfully.
+"""
+
+webhook = os.environ.get("SLACK_WEBHOOK_URL")
+
+req = urllib.request.Request(
+    webhook,
+    data=json.dumps({"text": msg}).encode("utf-8"),
+    headers={"Content-Type": "application/json"},
+    method="POST"
+)
+
+urllib.request.urlopen(req, timeout=30)
+print("Fallback Slack failure notification sent.")
+PY
+            fi
           '''
         }
       }
 
       archiveArtifacts artifacts: 'ai-report/**', allowEmptyArchive: true, fingerprint: true
+    }
+
+    always {
+      echo "Pipeline finished. Final status: ${currentBuild.currentResult}"
     }
   }
 }
